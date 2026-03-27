@@ -10,10 +10,15 @@ struct Args {
     devid: i32,
     #[arg(long)]
     bmodel: PathBuf,
+    #[arg(long)]
+    libdir: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(p) = args.libdir {
+        std::env::set_var("SOPHON_SDK_LIBDIR", p);
+    }
     let mut rt = SophonRuntime::new_auto(args.devid)?;
     println!("使用后端: {}", rt.backend_name());
     rt.load_bmodel(&args.bmodel)?;

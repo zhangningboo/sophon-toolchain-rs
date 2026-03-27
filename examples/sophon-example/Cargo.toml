@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sophon-runtime = { path = "../../sophon-runtime" }
+sophon-runtime = { path = "../../sophon-runtime", features = ["ffi"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

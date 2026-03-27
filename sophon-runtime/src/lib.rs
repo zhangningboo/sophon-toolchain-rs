@@ -69,10 +69,20 @@ impl SophonRuntime {
     pub fn new_auto(devid: i32) -> Result<Self> {
         #[cfg(feature = "ffi")]
         {
+            if let Ok(v) = std::env::var("SOPHON_FORCE_MOCK") {
+                if v == "1" || v.eq_ignore_ascii_case("true") {
+                    let b = MockBackend::create(0)?;
+                    return Ok(Self { backend: b });
+                }
+            }
             let b = FfiBackend::create(devid)?;
             return Ok(Self { backend: b });
         }
-        Err(Error::Backend("未启用 FFI 后端".into()))
+        #[cfg(not(feature = "ffi"))]
+        {
+            let b = MockBackend::create(0)?;
+            Ok(Self { backend: b })
+        }
     }
     pub fn load_bmodel(&mut self, path: impl AsRef<Path>) -> Result<()> {
         self.backend.load_bmodel(path.as_ref())
@@ -86,6 +96,25 @@ impl SophonRuntime {
     pub fn backend_name(&self) -> &'static str {
         self.backend.name()
     }
+}
+#[cfg(feature = "ffi")]
+pub fn available_devices(max_probe: i32) -> Result<Vec<i32>> {
+    let mut v = Vec::new();
+    for id in 0..max_probe {
+        match FfiBackend::create(id) {
+            Ok(b) => {
+                v.push(id);
+                drop(b);
+            }
+            Err(_) => {}
+        }
+    }
+    Ok(v)
+}
+
+#[cfg(not(feature = "ffi"))]
+pub fn available_devices(_max_probe: i32) -> Result<Vec<i32>> {
+    Ok(vec![0])
 }
 
 struct MockBackend;
@@ -232,6 +261,8 @@ impl RuntimeBackend for FfiBackend {
             if let Some(dir) = &libdir {
                 v.push(Path::new(dir).join(name));
             }
+            v.push(Path::new("/opt/sophon/libsophon-current/lib").join(name));
+            v.push(Path::new("/opt/sophon/lib").join(name));
             v.push(Path::new(name).to_path_buf());
             v
         };
@@ -318,7 +349,7 @@ impl RuntimeBackend for FfiBackend {
             let mut handle: *mut std::ffi::c_void = std::ptr::null_mut();
             let s = bm_dev_request(&mut handle, devid);
             if s != 0 {
-                return Err(Error::Backend(format!("bm_dev_request 失败: {}", s)));
+                return Err(Error::Backend(format!("bm_dev_request 失败(code: {})，请检查驱动是否已安装并启用、/dev/bmdev* 是否存在、权限是否足够", s)));
             }
             let p_bmrt = bmrt_create(handle);
             if p_bmrt.is_null() {
@@ -454,6 +485,7 @@ mod tests {
     use super::*;
     #[test]
     fn mock_infer_roundtrip() {
+        std::env::set_var("SOPHON_FORCE_MOCK", "1");
         let mut rt = SophonRuntime::new_auto(0).unwrap();
         let tmp = tempfile::NamedTempFile::new().unwrap();
         rt.load_bmodel(tmp.path()).unwrap();
