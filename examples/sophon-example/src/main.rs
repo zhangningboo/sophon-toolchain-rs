@@ -27,8 +27,8 @@ fn main() -> anyhow::Result<()> {
 
     let input = Tensor {
         dtype: DType::F32,
-        shape: Shape::new(vec![1, 3, 28, 28]),
-        data: vec![0u8; 1 * 3 * 28 * 28 * 4],
+        shape: Shape::new(vec![1, 3, 640, 640]),
+        data: vec![0u8; 1 * 3 * 640 * 640 * 4],
     };
     let outs = rt.infer(&nets[0], &[input])?;
     println!(
