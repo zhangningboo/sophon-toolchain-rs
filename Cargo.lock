@@ -369,6 +369,7 @@ dependencies = [
 name = "sophon-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "libloading",
  "serde",
  "tempfile",
