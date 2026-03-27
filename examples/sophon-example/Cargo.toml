@@ -1,0 +1,9 @@
+[package]
+name = "sophon-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sophon-runtime = { path = "../../sophon-runtime" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

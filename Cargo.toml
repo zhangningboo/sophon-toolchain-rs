@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "sophon-runtime",
+    "examples/sophon-example",
+]
+resolver = "2"
+

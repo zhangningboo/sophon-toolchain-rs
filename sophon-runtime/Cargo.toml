@@ -1,0 +1,24 @@
+[package]
+name = "sophon-runtime"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Rust 安全封装的 Sophon BMRuntime/BMLib 接口，支持加载 bmodel 并推理"
+repository = ""
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["auto-backend"]
+auto-backend = []
+ffi = ["libloading"]
+mock = []
+
+[dependencies]
+libloading = { version = "0.8", optional = true }
+thiserror = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
