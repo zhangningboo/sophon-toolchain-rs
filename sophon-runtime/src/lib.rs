@@ -584,6 +584,10 @@ impl RuntimeBackend for FfiBackend {
         if !ok {
             return Err(Error::Backend("bmrt_launch_data 失败".into()));
         }
+        let sync_ret = unsafe { (self.bm_thread_sync)(self.bm_handle) };
+        if sync_ret != 0 {
+            return Err(Error::Backend(format!("bm_thread_sync 失败(code: {})", sync_ret)));
+        }
         let dtypes_slice =
             unsafe { std::slice::from_raw_parts(net_info.output_dtypes, output_num as usize) };
         let mut outs = Vec::with_capacity(output_num as usize);
