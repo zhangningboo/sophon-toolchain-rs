@@ -37,6 +37,23 @@ pub struct Tensor {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+pub struct IoDesc {
+    pub name: String,
+    pub dtype: DType,
+    pub scale: f32,
+    pub shape: Shape,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetInfo {
+    pub name: String,
+    pub input_num: i32,
+    pub output_num: i32,
+    pub inputs: Vec<IoDesc>,
+    pub outputs: Vec<IoDesc>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("backend error: {0}")]
@@ -58,6 +75,7 @@ pub trait RuntimeBackend: Send + Sync {
         Self: Sized;
     fn load_bmodel(&mut self, path: &Path) -> Result<()>;
     fn get_networks(&self) -> Result<Vec<String>>;
+    fn net_info(&self, net_name: &str) -> Result<NetInfo>;
     fn infer(&self, net_name: &str, inputs: &[Tensor]) -> Result<Vec<Tensor>>;
 }
 
@@ -69,19 +87,12 @@ impl SophonRuntime {
     pub fn new_auto(devid: i32) -> Result<Self> {
         #[cfg(feature = "ffi")]
         {
-            if let Ok(v) = std::env::var("SOPHON_FORCE_MOCK") {
-                if v == "1" || v.eq_ignore_ascii_case("true") {
-                    let b = MockBackend::create(0)?;
-                    return Ok(Self { backend: b });
-                }
-            }
             let b = FfiBackend::create(devid)?;
-            return Ok(Self { backend: b });
+            Ok(Self { backend: b })
         }
         #[cfg(not(feature = "ffi"))]
         {
-            let b = MockBackend::create(0)?;
-            Ok(Self { backend: b })
+            Err(Error::Backend("未启用 FFI 后端".into()))
         }
     }
     pub fn load_bmodel(&mut self, path: impl AsRef<Path>) -> Result<()> {
@@ -89,6 +100,9 @@ impl SophonRuntime {
     }
     pub fn networks(&self) -> Result<Vec<String>> {
         self.backend.get_networks()
+    }
+    pub fn net_info(&self, net_name: &str) -> Result<NetInfo> {
+        self.backend.net_info(net_name)
     }
     pub fn infer(&self, net_name: &str, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
         self.backend.infer(net_name, inputs)
@@ -114,11 +128,13 @@ pub fn available_devices(max_probe: i32) -> Result<Vec<i32>> {
 
 #[cfg(not(feature = "ffi"))]
 pub fn available_devices(_max_probe: i32) -> Result<Vec<i32>> {
-    Ok(vec![0])
+    Ok(vec![])
 }
 
+#[cfg(feature = "mock")]
 struct MockBackend;
 
+#[cfg(feature = "mock")]
 impl RuntimeBackend for MockBackend {
     fn name(&self) -> &'static str {
         "mock"
@@ -140,6 +156,25 @@ impl RuntimeBackend for MockBackend {
     }
     fn get_networks(&self) -> Result<Vec<String>> {
         Ok(vec!["net".to_string()])
+    }
+    fn net_info(&self, net_name: &str) -> Result<NetInfo> {
+        Ok(NetInfo {
+            name: net_name.to_string(),
+            input_num: 1,
+            output_num: 1,
+            inputs: vec![IoDesc {
+                name: "input".to_string(),
+                dtype: DType::F32,
+                scale: 1.0,
+                shape: Shape::new(vec![1, 3, 640, 640]),
+            }],
+            outputs: vec![IoDesc {
+                name: "output".to_string(),
+                dtype: DType::F32,
+                scale: 1.0,
+                shape: Shape::new(vec![1, 8400, 84]),
+            }],
+        })
     }
     fn infer(&self, _net_name: &str, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
         if inputs.is_empty() {
@@ -401,11 +436,109 @@ impl RuntimeBackend for FfiBackend {
         unsafe { libc::free(networks as *mut libc::c_void) };
         Ok(out)
     }
+    fn net_info(&self, net_name: &str) -> Result<NetInfo> {
+        let c_name = std::ffi::CString::new(net_name.as_bytes())
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let net_info_ptr = unsafe { (self.bmrt_get_network_info)(self.p_bmrt, c_name.as_ptr()) };
+        if net_info_ptr.is_null() {
+            return Err(Error::Backend("bmrt_get_network_info 失败".into()));
+        }
+        let net_info = unsafe { &*net_info_ptr };
+        if net_info.stage_num <= 0 || net_info.stages.is_null() {
+            return Err(Error::Backend("network stage 为空".into()));
+        }
+        let stages =
+            unsafe { std::slice::from_raw_parts(net_info.stages, net_info.stage_num as usize) };
+        let stage0 = &stages[0];
+
+        let input_names =
+            unsafe { std::slice::from_raw_parts(net_info.input_names, net_info.input_num as usize) };
+        let input_dtypes = unsafe {
+            std::slice::from_raw_parts(net_info.input_dtypes, net_info.input_num as usize)
+        };
+        let input_scales = unsafe {
+            std::slice::from_raw_parts(net_info.input_scales, net_info.input_num as usize)
+        };
+        let input_shapes =
+            unsafe { std::slice::from_raw_parts(stage0.input_shapes, net_info.input_num as usize) };
+
+        let mut inputs = Vec::with_capacity(net_info.input_num as usize);
+        for i in 0..(net_info.input_num as usize) {
+            let name = if input_names[i].is_null() {
+                format!("input_{}", i)
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(input_names[i]) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let shape = {
+                let s = &input_shapes[i];
+                let mut v = Vec::with_capacity(s.num_dims as usize);
+                for j in 0..(s.num_dims as usize) {
+                    v.push(s.dims[j]);
+                }
+                Shape { dims: v }
+            };
+            inputs.push(IoDesc {
+                name,
+                dtype: dtype_map(input_dtypes[i]),
+                scale: input_scales[i],
+                shape,
+            });
+        }
+
+        let output_names = unsafe {
+            std::slice::from_raw_parts(net_info.output_names, net_info.output_num as usize)
+        };
+        let output_dtypes = unsafe {
+            std::slice::from_raw_parts(net_info.output_dtypes, net_info.output_num as usize)
+        };
+        let output_scales = unsafe {
+            std::slice::from_raw_parts(net_info.output_scales, net_info.output_num as usize)
+        };
+        let output_shapes = unsafe {
+            std::slice::from_raw_parts(stage0.output_shapes, net_info.output_num as usize)
+        };
+
+        let mut outputs = Vec::with_capacity(net_info.output_num as usize);
+        for i in 0..(net_info.output_num as usize) {
+            let name = if output_names[i].is_null() {
+                format!("output_{}", i)
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(output_names[i]) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let shape = {
+                let s = &output_shapes[i];
+                let mut v = Vec::with_capacity(s.num_dims as usize);
+                for j in 0..(s.num_dims as usize) {
+                    v.push(s.dims[j]);
+                }
+                Shape { dims: v }
+            };
+            outputs.push(IoDesc {
+                name,
+                dtype: dtype_map(output_dtypes[i]),
+                scale: output_scales[i],
+                shape,
+            });
+        }
+
+        Ok(NetInfo {
+            name: net_name.to_string(),
+            input_num: net_info.input_num,
+            output_num: net_info.output_num,
+            inputs,
+            outputs,
+        })
+    }
     fn infer(&self, net_name: &str, inputs: &[Tensor]) -> Result<Vec<Tensor>> {
         if inputs.is_empty() {
             return Err(Error::Invalid("输入为空".into()));
         }
-        let c_name = std::ffi::CString::new(net_name.as_bytes()).map_err(|e| Error::Invalid(e.to_string()))?;
+        let c_name = std::ffi::CString::new(net_name.as_bytes())
+            .map_err(|e| Error::Invalid(e.to_string()))?;
         let net_info_ptr = unsafe { (self.bmrt_get_network_info)(self.p_bmrt, c_name.as_ptr()) };
         if net_info_ptr.is_null() {
             return Err(Error::Backend("bmrt_get_network_info 失败".into()));
@@ -420,11 +553,21 @@ impl RuntimeBackend for FfiBackend {
             for (i, d) in t.shape.dims.iter().enumerate().take(8) {
                 dims[i] = *d;
             }
-            in_shapes.push(BmShape { num_dims: t.shape.dims.len() as i32, dims });
+            in_shapes.push(BmShape {
+                num_dims: t.shape.dims.len() as i32,
+                dims,
+            });
         }
         let output_num = net_info.output_num;
-        let mut out_ptrs: Vec<*mut std::ffi::c_void> = vec![std::ptr::null_mut(); output_num as usize];
-        let mut out_shapes: Vec<BmShape> = vec![BmShape { num_dims: 0, dims: [0; 8] }; output_num as usize];
+        let mut out_ptrs: Vec<*mut std::ffi::c_void> =
+            vec![std::ptr::null_mut(); output_num as usize];
+        let mut out_shapes: Vec<BmShape> = vec![
+            BmShape {
+                num_dims: 0,
+                dims: [0; 8],
+            };
+            output_num as usize
+        ];
         let ok = unsafe {
             (self.bmrt_launch_data)(
                 self.p_bmrt,
@@ -441,7 +584,8 @@ impl RuntimeBackend for FfiBackend {
         if !ok {
             return Err(Error::Backend("bmrt_launch_data 失败".into()));
         }
-        let dtypes_slice = unsafe { std::slice::from_raw_parts(net_info.output_dtypes, output_num as usize) };
+        let dtypes_slice =
+            unsafe { std::slice::from_raw_parts(net_info.output_dtypes, output_num as usize) };
         let mut outs = Vec::with_capacity(output_num as usize);
         for i in 0..(output_num as usize) {
             let shape = {
@@ -459,7 +603,8 @@ impl RuntimeBackend for FfiBackend {
             if ptr.is_null() {
                 return Err(Error::Backend("输出指针为空".into()));
             }
-            let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, total_bytes) }.to_vec();
+            let data =
+                unsafe { std::slice::from_raw_parts(ptr as *const u8, total_bytes) }.to_vec();
             unsafe { libc::free(ptr as *mut libc::c_void) };
             outs.push(Tensor {
                 dtype: dtype_map(dtypes_slice[i]),
@@ -484,18 +629,11 @@ impl Drop for FfiBackend {
 mod tests {
     use super::*;
     #[test]
-    fn mock_infer_roundtrip() {
-        std::env::set_var("SOPHON_FORCE_MOCK", "1");
-        let mut rt = SophonRuntime::new_auto(0).unwrap();
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        rt.load_bmodel(tmp.path()).unwrap();
-        let input = Tensor {
-            dtype: DType::F32,
-            shape: Shape::new(vec![1, 3, 28, 28]),
-            data: vec![0u8; 1 * 3 * 28 * 28 * 4],
-        };
-        let outs = rt.infer("net", &[input]).unwrap();
-        assert_eq!(outs.len(), 1);
-        assert_eq!(outs[0].shape.elements(), (1 * 3 * 28 * 28) as u64);
+    fn shape_elements() {
+        assert_eq!(Shape::new(Vec::<i32>::new()).elements(), 1);
+        assert_eq!(
+            Shape::new(vec![1, 3, 28, 28]).elements(),
+            (1 * 3 * 28 * 28) as u64
+        );
     }
 }
